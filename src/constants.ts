@@ -1,4 +1,6 @@
-export const CLIENT_ID = "Ov23liN8a7D1bDe2571X";
+// Injected at build time by esbuild's `define` from .env (or CI secret).
+// See esbuild.config.mjs and .env.example.
+export const CLIENT_ID = process.env.CLIENT_ID ?? "";
 
 export const GITHUB_DEVICE_URL = "https://github.com/login/device/code";
 export const GITHUB_TOKEN_URL  = "https://github.com/login/oauth/access_token";
