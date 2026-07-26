@@ -10,6 +10,11 @@ dotenv.config();
 
 const clientId = process.env.CLIENT_ID ?? "";
 
+// Keep Node builtins external (Electron provides them on desktop) EXCEPT
+// `buffer`: mobile has no Node runtime, so `buffer` must be bundled from the
+// npm polyfill and `Buffer` injected as a global. See buffer-shim.mjs.
+const externalBuiltins = builtinModules.filter((m) => m !== "buffer");
+
 if (prod && !clientId) {
   console.error(
     "\nERROR: CLIENT_ID is not set. Create a .env file (see .env.example) " +
@@ -39,8 +44,9 @@ esbuild.build({
     "@lezer/common",
     "@lezer/highlight",
     "@lezer/lr",
-    ...builtinModules,
+    ...externalBuiltins,
   ],
+  inject: ["buffer-shim.mjs"],
   format: "cjs",
   target: "es2018",
   logLevel: "info",
