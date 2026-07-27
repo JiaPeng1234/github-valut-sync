@@ -225,8 +225,12 @@ export class GitSync {
    */
   async sync(changedFiles: string[]): Promise<SyncResult> {
     const conflicts: ConflictFile[] = [];
-    const L = "[git-sync]";
-    console.log(`${L} sync() start — ${changedFiles.length} changed files`);
+    const logs: string[] = [];
+    // Collect logs into an array (shown in a modal on mobile) AND console.log.
+    const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
+    const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
+
+    log(`sync() start — ${changedFiles.length} changed files`);
 
     try {
       // ── 1. Stage ─────────────────────────────────────────────────────────────
@@ -239,7 +243,7 @@ export class GitSync {
           } catch { /* skip */ }
         }
       }
-      console.log(`${L} step 1 stage done`);
+      log(`step1 stage done`);
 
       // ── 2. Commit if dirty ───────────────────────────────────────────────────
       // Wrap statusMatrix: some isomorphic-git versions throw on an unborn branch.
@@ -251,7 +255,7 @@ export class GitSync {
         // Fall back: assume dirty when files were changed
         hasDirty = changedFiles.length > 0;
       }
-      console.log(`${L} step 2 hasDirty=${hasDirty}`);
+      log(`step2 hasDirty=${hasDirty}`);
 
       if (hasDirty) {
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -259,13 +263,13 @@ export class GitSync {
           ...this.gitOpts(),
           message: `sync: ${now}`,
         });
-        console.log(`${L} step 2 committed local oid=${oid}`);
+        log(`step2 committed local=${short(oid)}`);
         // refs/heads/main is now guaranteed to exist
       }
 
       // ── 3. Fetch ─────────────────────────────────────────────────────────────
       const fetchHead = await this.safeFetch();
-      console.log(`${L} step 3 fetchHead=${fetchHead}`);
+      log(`step3 fetchHead=${short(fetchHead)}`);
 
       // ── 4. Merge ─────────────────────────────────────────────────────────────
       if (fetchHead && (await this.hasLocalBranch())) {
@@ -274,7 +278,7 @@ export class GitSync {
           dir: this.dir,
           ref: DEFAULT_BRANCH,
         });
-        console.log(`${L} step 4 localHead=${localHead} fetchHead=${fetchHead} equal=${localHead === fetchHead}`);
+        log(`step4 localHead=${short(localHead)} fetchHead=${short(fetchHead)} equal=${localHead === fetchHead}`);
 
         if (fetchHead !== localHead) {
           try {
@@ -287,12 +291,13 @@ export class GitSync {
               message: "sync: merge remote changes",
               fastForwardOnly: false,
             });
-            console.log(`${L} step 4 merge result=${JSON.stringify(mergeRes)}`);
+            log(`step4 mergeRes=${JSON.stringify(mergeRes)}`);
             const headAfterMerge = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-            console.log(`${L} step 4 main after merge=${headAfterMerge}`);
+            log(`step4 main-after-merge=${short(headAfterMerge)}`);
           } catch (mergeErr) {
+            const code = (mergeErr as { code?: string })?.code ?? "?";
             const m = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-            console.error(`${L} step 4 MERGE THREW: ${(mergeErr as { code?: string })?.code ?? "?"} — ${m}`);
+            log(`step4 MERGE THREW code=${code} msg=${m}`);
             throw mergeErr;
           }
         }
@@ -309,25 +314,32 @@ export class GitSync {
           }
         }
       }
-      console.log(`${L} step 5 conflicts=${conflicts.length}`);
+      log(`step5 conflicts=${conflicts.length}`);
 
       // ── 6. Push ──────────────────────────────────────────────────────────────
       if (conflicts.length === 0 && (await this.hasLocalBranch())) {
         const pushRef = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-        console.log(`${L} step 6 pushing main=${pushRef}`);
-        const pushRes = await git.push({
-          ...this.netOpts(),
-          ref: DEFAULT_BRANCH,
-        });
-        console.log(`${L} step 6 push result=${JSON.stringify(pushRes)}`);
+        log(`step6 pushing main=${short(pushRef)}`);
+        try {
+          const pushRes = await git.push({
+            ...this.netOpts(),
+            ref: DEFAULT_BRANCH,
+          });
+          log(`step6 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
+        } catch (pushErr) {
+          const code = (pushErr as { code?: string })?.code ?? "?";
+          const m = pushErr instanceof Error ? pushErr.message : String(pushErr);
+          log(`step6 PUSH THREW code=${code} msg=${m}`);
+          throw pushErr;
+        }
       }
 
-      console.log(`${L} sync() success conflicts=${conflicts.length}`);
-      return { success: conflicts.length === 0, conflictFiles: conflicts };
+      log(`sync() OK conflicts=${conflicts.length}`);
+      return { success: conflicts.length === 0, conflictFiles: conflicts, logs };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
-      console.error(`${L} sync() FAILED: ${msg}`);
-      return { success: false, conflictFiles: [], error: msg };
+      log(`sync() FAILED: ${msg}`);
+      return { success: false, conflictFiles: [], error: msg, logs };
     }
   }
 

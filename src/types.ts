@@ -67,4 +67,5 @@ export interface SyncResult {
   success: boolean;
   conflictFiles: ConflictFile[];
   error?: string;
+  logs?: string[];  // step-by-step diagnostic trace (shown on mobile where no console is reachable)
 }

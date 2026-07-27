@@ -1,4 +1,4 @@
-import { Plugin, Notice, TFile, TAbstractFile } from "obsidian";
+import { Plugin, Notice, TFile, TAbstractFile, Modal } from "obsidian";
 import { PluginSettings, DEFAULT_SETTINGS, SyncStatus, ConflictFile } from "./types";
 import { MultiSyncSettingsTab } from "./ui/settings-tab";
 import { StatusBarItem } from "./ui/status-bar";
@@ -206,6 +206,14 @@ export default class MultiSyncPlugin extends Plugin {
 
       const result = await this.gitSync.sync(allFiles);
 
+      // DEBUG: show the full step-by-step trace on-screen (mobile has no console).
+      if (result.logs && result.logs.length) {
+        const header = result.success
+          ? "Sync OK"
+          : `Sync error: ${result.error ?? "unknown"}`;
+        showLogModal(this.app, header, result.logs);
+      }
+
       if (result.conflictFiles.length > 0) {
         this.setStatus("conflict");
         this.showConflictModal(result.conflictFiles);
@@ -216,7 +224,6 @@ export default class MultiSyncPlugin extends Plugin {
         new Notice("Vault synced successfully.");
       } else {
         this.setStatus("error", result.error);
-        new Notice(`Sync error: ${result.error}`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -246,4 +253,30 @@ export default class MultiSyncPlugin extends Plugin {
       return new RegExp(`^${regexStr}$`).test(filepath);
     });
   }
+}
+
+/**
+ * DEBUG helper: show a scrollable log trace on-screen. Used because mobile has
+ * no reachable dev console. Includes a Copy button so the trace can be shared.
+ */
+function showLogModal(app: import("obsidian").App, header: string, logs: string[]): void {
+  const modal = new Modal(app);
+  modal.titleEl.setText(header);
+  const body = logs.join("\n");
+
+  const pre = modal.contentEl.createEl("pre");
+  pre.style.cssText =
+    "white-space:pre-wrap;word-break:break-all;font-family:monospace;" +
+    "font-size:12px;max-height:60vh;overflow:auto;user-select:text;" +
+    "background:var(--background-secondary);padding:8px;border-radius:6px;";
+  pre.setText(body);
+
+  const btn = modal.contentEl.createEl("button", { text: "Copy" });
+  btn.style.marginTop = "8px";
+  btn.onclick = () => {
+    navigator.clipboard?.writeText(body);
+    new Notice("Log copied.");
+  };
+
+  modal.open();
 }
