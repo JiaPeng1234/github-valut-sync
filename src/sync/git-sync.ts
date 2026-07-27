@@ -131,12 +131,22 @@ export class GitSync {
    */
   private async safeFetch(): Promise<string | null> {
     try {
-      await git.fetch({
+      // git.fetch returns the fetched head oid directly. isomorphic-git does not
+      // reliably write a FETCH_HEAD ref (especially with a custom fs), so use the
+      // return value; fall back to the remote-tracking ref it *does* update.
+      const res = await git.fetch({
         ...this.netOpts(),
         ref: DEFAULT_BRANCH,
         singleBranch: true,
       });
-      return await git.resolveRef({ fs: this.fs, dir: this.dir, ref: "FETCH_HEAD" });
+      if (res.fetchHead) return res.fetchHead;
+
+      // Fallback: read refs/remotes/origin/main (updated by fetch).
+      return await git.resolveRef({
+        fs: this.fs,
+        dir: this.dir,
+        ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
+      });
     } catch (e) {
       // Surface WHY fetch failed instead of silently swallowing it.
       const code = (e as { code?: string })?.code ?? "?";
