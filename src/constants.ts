@@ -1,6 +1,5 @@
-// Injected at build time by esbuild's `define` from .env (or CI secret).
-// See esbuild.config.mjs and .env.example.
-export const CLIENT_ID = process.env.CLIENT_ID ?? "";
+// The GitHub OAuth App Client ID is supplied by the user in plugin settings —
+// there is no build-time default. See README (§ Register a GitHub OAuth App).
 
 export const GITHUB_DEVICE_URL = "https://github.com/login/device/code";
 export const GITHUB_TOKEN_URL  = "https://github.com/login/oauth/access_token";

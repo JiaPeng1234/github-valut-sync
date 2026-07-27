@@ -1,6 +1,5 @@
 import { requestUrl } from "obsidian";
 import {
-  CLIENT_ID,
   GITHUB_DEVICE_URL,
   GITHUB_TOKEN_URL,
 } from "../constants";
@@ -10,7 +9,7 @@ import { DeviceFlowResponse } from "../types";
  * Step 1: Request a device code from GitHub.
  * Returns the user_code to display and the device_code to poll with.
  */
-export async function requestDeviceCode(): Promise<DeviceFlowResponse> {
+export async function requestDeviceCode(clientId: string): Promise<DeviceFlowResponse> {
   const response = await requestUrl({
     url: GITHUB_DEVICE_URL,
     method: "POST",
@@ -18,7 +17,7 @@ export async function requestDeviceCode(): Promise<DeviceFlowResponse> {
       Accept: "application/json",
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: `client_id=${CLIENT_ID}&scope=repo`,
+    body: `client_id=${encodeURIComponent(clientId)}&scope=repo`,
     throw: false,
   });
 
@@ -35,6 +34,7 @@ export async function requestDeviceCode(): Promise<DeviceFlowResponse> {
  * Throws on expiry or denial.
  */
 export async function pollForToken(
+  clientId: string,
   deviceCode: string,
   intervalSeconds: number,
   expiresIn: number,
@@ -59,7 +59,7 @@ export async function pollForToken(
           Accept: "application/json",
           "Content-Type": "application/x-www-form-urlencoded",
         },
-        body: `client_id=${CLIENT_ID}&device_code=${deviceCode}&grant_type=urn:ietf:params:oauth:grant-type:device_code`,
+        body: `client_id=${encodeURIComponent(clientId)}&device_code=${deviceCode}&grant_type=urn:ietf:params:oauth:grant-type:device_code`,
         throw: false,
       });
 

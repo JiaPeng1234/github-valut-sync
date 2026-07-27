@@ -74,43 +74,10 @@ npm install
 This installs:
 - `isomorphic-git` — pure-JS git engine (works on mobile, no native binaries)
 - `esbuild` — fast bundler
-- `dotenv` — loads `CLIENT_ID` from `.env` at build time
 - `typescript` — type definitions / optional type checking (not part of the build)
 - `obsidian` — type definitions only (not bundled)
 
-### 1.3 — Register a GitHub OAuth App
-
-You need to register a free OAuth App so users can log in with their GitHub account.
-This is done **once** — the Client ID is stored in a local `.env` file and injected
-into the build by esbuild (see `esbuild.config.mjs`). It is never hardcoded in source.
-
-> Make sure to enable **Device Flow** on the OAuth App — this plugin authenticates
-> via the Device Flow and will not work without it.
-
-1. Go to [github.com/settings/developers](https://github.com/settings/developers)
-2. Click **OAuth Apps** → **New OAuth App**
-3. Fill in the form:
-
-   | Field | Value |
-   |---|---|
-   | Application name | `Obsidian Vault Sync` *(any name — see note below)* |
-   | Homepage URL | `https://github.com/livan116/github-valut-sync` |
-   | Authorization callback URL | `https://obsidian.md` *(placeholder — Device Flow doesn't use this)* |
-
-   > The **application name is purely a display label** shown on the GitHub
-   > authorization screen — nothing in the plugin references it, so pick anything you like.
-   > Note: GitHub **rejects names containing "GitHub"**, so don't start it with that word.
-
-4. Click **Register application**
-5. Copy the **Client ID** (looks like `Ov23li...`)
-6. Copy `.env.example` to `.env` and set your Client ID:
-   ```
-   CLIENT_ID=Ov23liYOUR_ACTUAL_ID
-   ```
-
-> **Do not** generate a Client Secret — Device Flow doesn't need it and secrets must never be embedded in plugin code.
-
-### 1.4 — Build the Plugin
+### 1.3 — Build the Plugin
 
 ```bash
 # Development build (watch mode — rebuilds on every save)
@@ -120,26 +87,21 @@ npm run dev
 npm run build
 ```
 
-Both commands output a single `main.js` file in the project root. At build time
-esbuild reads `CLIENT_ID` (from `.env`, or from a real environment variable if set)
-and injects it into the bundle. A **production** build (`npm run build`) fails fast
-with an error if `CLIENT_ID` is missing; a **dev** build (`npm run dev`) still runs so
-you can work on non-auth features.
+Both commands output a single `main.js` file in the project root. There are **no
+build-time secrets** — the GitHub OAuth Client ID is entered by each user in plugin
+settings at runtime (see [Part 3](#part-3--connecting-your-github-account)), so the
+build needs no `.env` or CI secret.
 
 **Watch mode** (`npm run dev`) keeps running and rebuilds automatically as you edit source files. Leave it running while you test in Obsidian.
 
-> **CI / releases:** the GitHub Actions release workflow sets `CLIENT_ID` from a
-> repository secret (not from `.env`, which is git-ignored). An exported environment
-> variable always takes precedence over the `.env` file.
-
-### 1.5 — Project Structure
+### 1.4 — Project Structure
 
 ```
 github-valut-sync/
 ├── src/
 │   ├── main.ts                   # Plugin entry point — wires everything together
 │   ├── types.ts                  # All TypeScript interfaces & types
-│   ├── constants.ts              # App-wide constants (reads CLIENT_ID from process.env, set by esbuild define)
+│   ├── constants.ts              # App-wide constants (URLs, branch, debounce)
 │   ├── auth/
 │   │   └── github-device.ts      # GitHub OAuth Device Flow (no server needed)
 │   ├── github/
@@ -153,8 +115,6 @@ github-valut-sync/
 │       ├── settings-tab.ts       # Plugin settings page
 │       ├── conflict-modal.ts     # Side-by-side conflict resolution modal
 │       └── status-bar.ts         # Live sync indicator in the status bar
-├── .env                          # Local secrets — git-ignored, never committed
-├── .env.example                  # Template — copy to .env and fill in CLIENT_ID
 ├── manifest.json                 # Obsidian plugin manifest
 ├── package.json
 ├── tsconfig.json
@@ -206,11 +166,28 @@ ln -s /path/to/github-valut-sync /path/to/vault/.obsidian/plugins/git-obsi-sync
 
 > Do this on **every device** where you want sync. Use the **same GitHub account** each time.
 
-### Step 1 — Open Plugin Settings
+### Step 1 — Register a GitHub OAuth App (one-time)
 
-Go to **Settings** → **Git Sync** (scroll down in the left sidebar under Community Plugins).
+The plugin authenticates through **your own** GitHub OAuth App — there is no shared/built-in
+app, so you register one once and reuse its Client ID on every device.
 
-### Step 2 — Click "Connect GitHub"
+1. Go to [github.com/settings/developers](https://github.com/settings/developers) → **OAuth Apps** → **New OAuth App**.
+2. Fill in:
+
+   | Field | Value |
+   |---|---|
+   | Application name | Anything *except* a name containing "GitHub" (GitHub rejects those). It's just the label shown on the authorization screen. |
+   | Homepage URL | `https://obsidian.md` (any valid URL works) |
+   | Authorization callback URL | `https://obsidian.md` (placeholder — Device Flow doesn't use it) |
+
+3. **Register application**, then **enable Device Flow** on the app's settings page — the plugin will not work without it.
+4. Copy the **Client ID** (looks like `Ov23li…`). **Do not** create a Client Secret — Device Flow doesn't need one.
+
+### Step 2 — Enter the Client ID in Obsidian
+
+Go to **Settings** → **Git Sync**, paste your Client ID into **GitHub OAuth Client ID**.
+
+### Step 3 — Click "Connect GitHub"
 
 You will see a screen like this:
 
@@ -227,7 +204,7 @@ You will see a screen like this:
 
 Your browser will open automatically. If it doesn't, copy the URL manually.
 
-### Step 3 — Enter the Code in Your Browser
+### Step 4 — Enter the Code in Your Browser
 
 1. The GitHub page asks: **"Enter the code shown in your app"**
 2. Type in the 8-character code (e.g. `AB12-CD34`)
@@ -235,7 +212,7 @@ Your browser will open automatically. If it doesn't, copy the URL manually.
 4. Review what access the plugin requests: **private repos** (to create and sync your vault repo)
 5. Click **Authorize**
 
-### Step 4 — Done
+### Step 5 — Done
 
 Back in Obsidian you'll see:
 
@@ -392,8 +369,10 @@ The `.git` folder is hidden in Obsidian by default. If you see it, go to
 ### Build fails with "Cannot find module 'obsidian'"
 Run `npm install` to install devDependencies. The `obsidian` package provides types only.
 
-### Build warns "CLIENT_ID is not set"
-Copy `.env.example` to `.env` and fill in your GitHub OAuth App Client ID.
+### "Enter your GitHub OAuth App's Client ID before connecting"
+You haven't set a Client ID yet. Register an OAuth App with Device Flow enabled
+(see [Part 3 · Step 1](#step-1--register-a-github-oauth-app-one-time)) and paste its
+Client ID into **Settings → Git Sync → GitHub OAuth Client ID**.
 
 ### TypeScript errors after pulling
 Run `npm install` — a dependency may have been added. Then re-run `npm run build`.
@@ -466,15 +445,12 @@ cd github-valut-sync
 # 2. Install deps
 npm install
 
-# 3. Copy .env.example to .env and set your CLIENT_ID
-cp .env.example .env
-
-# 4. Start watch mode
+# 3. Start watch mode (no .env / secret needed — Client ID is entered at runtime)
 npm run dev
 
-# 5. Symlink into your test vault (see Part 2 above)
-# 6. Make your changes — Obsidian hot-reloads the plugin automatically
-# 7. Run a type check before submitting
+# 4. Symlink into your test vault (see Part 2 above)
+# 5. Make your changes — Obsidian hot-reloads the plugin automatically
+# 6. Run a type check before submitting
 npx tsc --noEmit
 ```
 

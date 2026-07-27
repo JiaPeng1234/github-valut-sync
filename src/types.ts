@@ -1,4 +1,5 @@
 export interface PluginSettings {
+  clientId: string;              // user's own GitHub OAuth App Client ID (required to connect)
   githubToken: string;           // OAuth access token (stored locally)
   githubUsername: string;        // Authenticated GitHub username
   repoName: string;              // e.g. "obsidian-my-vault"
@@ -10,6 +11,7 @@ export interface PluginSettings {
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
+  clientId: "",
   githubToken: "",
   githubUsername: "",
   repoName: "",

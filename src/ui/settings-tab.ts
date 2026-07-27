@@ -46,6 +46,21 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
     } else {
       // Disconnected state
       new Setting(containerEl)
+        .setName("GitHub OAuth Client ID")
+        .setDesc(
+          "Required. Register a GitHub OAuth App with Device Flow enabled and paste its Client ID here. See the plugin README for step-by-step instructions."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("Ov23li…")
+            .setValue(settings.clientId)
+            .onChange(async (val) => {
+              settings.clientId = val.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(containerEl)
         .setName("Connect GitHub account")
         .setDesc(
           "Authorise MultiSync to access your private repos. Opens a browser window."
@@ -125,10 +140,18 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
   }
 
   private async startDeviceFlow(btn: ButtonComponent): Promise<void> {
+    const clientId = this.plugin.settings.clientId;
+    if (!clientId) {
+      new Notice(
+        "Enter your GitHub OAuth App's Client ID above before connecting."
+      );
+      return;
+    }
+
     btn.setButtonText("Connecting…").setDisabled(true);
 
     try {
-      const deviceFlow = await requestDeviceCode();
+      const deviceFlow = await requestDeviceCode(clientId);
 
       // Show the user their one-time code
       const modal = this.containerEl.createDiv({ cls: "multisync-device-modal" });
@@ -166,6 +189,7 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
 
       // Poll until approved
       const token = await pollForToken(
+        clientId,
         deviceFlow.device_code,
         deviceFlow.interval,
         deviceFlow.expires_in
