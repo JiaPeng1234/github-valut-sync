@@ -225,6 +225,8 @@ export class GitSync {
    */
   async sync(changedFiles: string[]): Promise<SyncResult> {
     const conflicts: ConflictFile[] = [];
+    const L = "[git-sync]";
+    console.log(`${L} sync() start — ${changedFiles.length} changed files`);
 
     try {
       // ── 1. Stage ─────────────────────────────────────────────────────────────
@@ -237,6 +239,7 @@ export class GitSync {
           } catch { /* skip */ }
         }
       }
+      console.log(`${L} step 1 stage done`);
 
       // ── 2. Commit if dirty ───────────────────────────────────────────────────
       // Wrap statusMatrix: some isomorphic-git versions throw on an unborn branch.
@@ -248,18 +251,21 @@ export class GitSync {
         // Fall back: assume dirty when files were changed
         hasDirty = changedFiles.length > 0;
       }
+      console.log(`${L} step 2 hasDirty=${hasDirty}`);
 
       if (hasDirty) {
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-        await git.commit({
+        const oid = await git.commit({
           ...this.gitOpts(),
           message: `sync: ${now}`,
         });
+        console.log(`${L} step 2 committed local oid=${oid}`);
         // refs/heads/main is now guaranteed to exist
       }
 
       // ── 3. Fetch ─────────────────────────────────────────────────────────────
       const fetchHead = await this.safeFetch();
+      console.log(`${L} step 3 fetchHead=${fetchHead}`);
 
       // ── 4. Merge ─────────────────────────────────────────────────────────────
       if (fetchHead && (await this.hasLocalBranch())) {
@@ -268,17 +274,27 @@ export class GitSync {
           dir: this.dir,
           ref: DEFAULT_BRANCH,
         });
+        console.log(`${L} step 4 localHead=${localHead} fetchHead=${fetchHead} equal=${localHead === fetchHead}`);
 
         if (fetchHead !== localHead) {
-          await git.merge({
-            fs: this.fs,
-            dir: this.dir,
-            ours: DEFAULT_BRANCH,
-            theirs: fetchHead,
-            author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
-            message: "sync: merge remote changes",
-            fastForwardOnly: false,
-          });
+          try {
+            const mergeRes = await git.merge({
+              fs: this.fs,
+              dir: this.dir,
+              ours: DEFAULT_BRANCH,
+              theirs: fetchHead,
+              author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
+              message: "sync: merge remote changes",
+              fastForwardOnly: false,
+            });
+            console.log(`${L} step 4 merge result=${JSON.stringify(mergeRes)}`);
+            const headAfterMerge = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+            console.log(`${L} step 4 main after merge=${headAfterMerge}`);
+          } catch (mergeErr) {
+            const m = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
+            console.error(`${L} step 4 MERGE THREW: ${(mergeErr as { code?: string })?.code ?? "?"} — ${m}`);
+            throw mergeErr;
+          }
         }
       }
 
@@ -293,18 +309,24 @@ export class GitSync {
           }
         }
       }
+      console.log(`${L} step 5 conflicts=${conflicts.length}`);
 
       // ── 6. Push ──────────────────────────────────────────────────────────────
       if (conflicts.length === 0 && (await this.hasLocalBranch())) {
-        await git.push({
+        const pushRef = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+        console.log(`${L} step 6 pushing main=${pushRef}`);
+        const pushRes = await git.push({
           ...this.netOpts(),
           ref: DEFAULT_BRANCH,
         });
+        console.log(`${L} step 6 push result=${JSON.stringify(pushRes)}`);
       }
 
+      console.log(`${L} sync() success conflicts=${conflicts.length}`);
       return { success: conflicts.length === 0, conflictFiles: conflicts };
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
+      console.error(`${L} sync() FAILED: ${msg}`);
       return { success: false, conflictFiles: [], error: msg };
     }
   }
