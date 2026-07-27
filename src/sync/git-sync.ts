@@ -137,10 +137,17 @@ export class GitSync {
         singleBranch: true,
       });
       return await git.resolveRef({ fs: this.fs, dir: this.dir, ref: "FETCH_HEAD" });
-    } catch {
+    } catch (e) {
+      // Surface WHY fetch failed instead of silently swallowing it.
+      const code = (e as { code?: string })?.code ?? "?";
+      const m = e instanceof Error ? e.message : String(e);
+      this.lastFetchError = `fetch failed code=${code} msg=${m}`;
       return null;
     }
   }
+
+  /** Set by safeFetch when a fetch attempt throws; read by sync() for logging. */
+  private lastFetchError: string | null = null;
 
   /**
    * Clone the remote into the vault directory.
@@ -268,8 +275,12 @@ export class GitSync {
       }
 
       // ── 3. Fetch ─────────────────────────────────────────────────────────────
+      this.lastFetchError = null;
       const fetchHead = await this.safeFetch();
       log(`step3 fetchHead=${short(fetchHead)}`);
+      if (fetchHead === null && this.lastFetchError) {
+        log(`step3 ${this.lastFetchError}`);
+      }
 
       // ── 4. Merge ─────────────────────────────────────────────────────────────
       if (fetchHead && (await this.hasLocalBranch())) {
