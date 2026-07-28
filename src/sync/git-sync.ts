@@ -232,25 +232,54 @@ export class GitSync {
   /**
    * Full sync cycle — runs on every file change and manual sync trigger.
    *
-   * Steps (each individually guarded to prevent one failure cascading):
-   *   1. Stage all changed files
-   *   2. Commit if dirty  (creates refs/heads/main on first run)
-   *   3. Fetch from remote
-   *   4. Merge FETCH_HEAD into local branch  (skipped if remote is empty)
-   *   5. Detect conflicts
-   *   6. Push  (skipped if conflicts or no local branch yet)
+   * Order matters: PULL FIRST, then commit local work, then push. Committing
+   * before pulling makes the local branch look "ahead" of the remote, so a
+   * later merge reports `alreadyMerged` and remote changes are never pulled.
+   *
+   *   1. Fetch + merge remote into local  (pull)
+   *   2. Stage changed files
+   *   3. Commit ONLY if the tree actually changed  (no phantom commits)
+   *   4. Detect conflicts
+   *   5. Push  (skipped if conflicts or nothing to push)
    */
   async sync(changedFiles: string[]): Promise<SyncResult> {
     const conflicts: ConflictFile[] = [];
     const logs: string[] = [];
-    // Collect logs into an array (shown in a modal on mobile) AND console.log.
     const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
 
-    log(`sync() start — ${changedFiles.length} changed files`);
+    log(`sync() start — ${changedFiles.length} candidate files`);
 
     try {
-      // ── 1. Stage ─────────────────────────────────────────────────────────────
+      // ── 1. Pull: fetch + merge remote FIRST ──────────────────────────────────
+      this.lastFetchError = null;
+      const fetchHead = await this.safeFetch();
+      log(`step1 fetchHead=${short(fetchHead)}`);
+      if (fetchHead === null && this.lastFetchError) log(`step1 ${this.lastFetchError}`);
+
+      if (fetchHead && (await this.hasLocalBranch())) {
+        const localHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+        if (fetchHead !== localHead) {
+          const mergeRes = await git.merge({
+            fs: this.fs,
+            dir: this.dir,
+            ours: DEFAULT_BRANCH,
+            theirs: fetchHead,
+            author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
+            message: "sync: merge remote changes",
+            fastForwardOnly: false,
+          });
+          log(`step1 merge=${JSON.stringify(mergeRes)} main=${short(await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH }))}`);
+          // Checkout so the merged tree lands in the working directory (files on disk).
+          try {
+            await git.checkout({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH, force: true });
+          } catch (e) {
+            log(`step1 checkout skipped: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      }
+
+      // ── 2. Stage changed files ───────────────────────────────────────────────
       for (const file of changedFiles) {
         try {
           await git.add({ fs: this.fs, dir: this.dir, filepath: file });
@@ -260,94 +289,33 @@ export class GitSync {
           } catch { /* skip */ }
         }
       }
-      log(`step1 stage done`);
 
-      // ── 2. Commit if dirty ───────────────────────────────────────────────────
-      // Wrap statusMatrix: some isomorphic-git versions throw on an unborn branch.
-      let hasDirty: boolean;
+      // ── 3. Commit ONLY if the staged tree differs from HEAD ───────────────────
+      // A row where stage != head means the commit would change the tree. If no
+      // such row exists, committing would just duplicate HEAD's tree (a phantom
+      // commit that advances local HEAD past the remote and blocks future pulls).
+      const hasLocal = await this.hasLocalBranch();
+      let stagedChange = false;
       try {
         const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-        const dirtyRows = matrix.filter(([, h, w, s]) => h !== 1 || w !== 1 || s !== 1);
-        hasDirty = dirtyRows.length > 0;
-        // Show exactly WHICH files are dirty and their H/W/S codes (first 20).
-        log(`step2 dirty=${dirtyRows.length}/${matrix.length}`);
-        for (const [fp, h, w, s] of dirtyRows.slice(0, 20)) {
-          log(`step2   ${fp} H=${h} W=${w} S=${s}`);
-        }
-        if (dirtyRows.length > 20) log(`step2   ...+${dirtyRows.length - 20} more`);
-        // Dump the fs-adapter call trace captured during statusMatrix.
-        const traceFn = (createFsAdapter as unknown as { lastTrace?: () => string[] }).lastTrace;
-        const tr = traceFn ? traceFn() : [];
-        log(`step2 fs-trace (${tr.length} calls):`);
-        for (const t of tr) log(`step2   ${t}`);
-      } catch (e) {
-        // Fall back: assume dirty when files were changed
-        hasDirty = changedFiles.length > 0;
-        log(`step2 statusMatrix THREW: ${e instanceof Error ? e.message : String(e)}`);
+        // [ , head, workdir, stage ]  — commit-worthy when stage differs from head.
+        stagedChange = matrix.some(([, head, , stage]) => stage !== head);
+      } catch {
+        stagedChange = changedFiles.length > 0; // unborn branch / status unavailable
       }
+      // On an unborn branch we must commit once to create refs/heads/main.
+      const mustCommit = stagedChange || !hasLocal;
+      log(`step3 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
 
-      if (hasDirty) {
-        // Record the tree BEFORE committing so we can tell if the commit is a
-        // phantom (identical tree = nothing really changed).
-        let treeBefore = "?";
-        try {
-          const cur = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-          const c = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
-          treeBefore = c.commit.tree;
-        } catch { /* unborn branch */ }
-
+      if (mustCommit) {
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
-        const oid = await git.commit({
-          ...this.gitOpts(),
-          message: `sync: ${now}`,
-        });
-        const newCommit = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
-        const treeAfter = newCommit.commit.tree;
-        log(`step2 committed local=${short(oid)} treeBefore=${short(treeBefore)} treeAfter=${short(treeAfter)} phantom=${treeBefore === treeAfter}`);
-        // refs/heads/main is now guaranteed to exist
+        const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
+        log(`step3 committed=${short(oid)}`);
+      } else {
+        log(`step3 nothing to commit`);
       }
 
-      // ── 3. Fetch ─────────────────────────────────────────────────────────────
-      this.lastFetchError = null;
-      const fetchHead = await this.safeFetch();
-      log(`step3 fetchHead=${short(fetchHead)}`);
-      if (fetchHead === null && this.lastFetchError) {
-        log(`step3 ${this.lastFetchError}`);
-      }
-
-      // ── 4. Merge ─────────────────────────────────────────────────────────────
-      if (fetchHead && (await this.hasLocalBranch())) {
-        const localHead = await git.resolveRef({
-          fs: this.fs,
-          dir: this.dir,
-          ref: DEFAULT_BRANCH,
-        });
-        log(`step4 localHead=${short(localHead)} fetchHead=${short(fetchHead)} equal=${localHead === fetchHead}`);
-
-        if (fetchHead !== localHead) {
-          try {
-            const mergeRes = await git.merge({
-              fs: this.fs,
-              dir: this.dir,
-              ours: DEFAULT_BRANCH,
-              theirs: fetchHead,
-              author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
-              message: "sync: merge remote changes",
-              fastForwardOnly: false,
-            });
-            log(`step4 mergeRes=${JSON.stringify(mergeRes)}`);
-            const headAfterMerge = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-            log(`step4 main-after-merge=${short(headAfterMerge)}`);
-          } catch (mergeErr) {
-            const code = (mergeErr as { code?: string })?.code ?? "?";
-            const m = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-            log(`step4 MERGE THREW code=${code} msg=${m}`);
-            throw mergeErr;
-          }
-        }
-      }
-
-      // ── 5. Detect conflicts ──────────────────────────────────────────────────
+      // ── 4. Detect conflicts ──────────────────────────────────────────────────
       if (await this.hasLocalBranch()) {
         const statusAfter = await git.statusMatrix({ fs: this.fs, dir: this.dir });
         for (const [filepath, head, workdir, stage] of statusAfter) {
@@ -358,23 +326,20 @@ export class GitSync {
           }
         }
       }
-      log(`step5 conflicts=${conflicts.length}`);
+      log(`step4 conflicts=${conflicts.length}`);
 
-      // ── 6. Push ──────────────────────────────────────────────────────────────
+      // ── 5. Push ──────────────────────────────────────────────────────────────
       if (conflicts.length === 0 && (await this.hasLocalBranch())) {
-        const pushRef = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-        log(`step6 pushing main=${short(pushRef)}`);
-        try {
-          const pushRes = await git.push({
-            ...this.netOpts(),
-            ref: DEFAULT_BRANCH,
-          });
-          log(`step6 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
-        } catch (pushErr) {
-          const code = (pushErr as { code?: string })?.code ?? "?";
-          const m = pushErr instanceof Error ? pushErr.message : String(pushErr);
-          log(`step6 PUSH THREW code=${code} msg=${m}`);
-          throw pushErr;
+        // Only push if local is actually ahead of the remote-tracking ref.
+        const localHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+        let remoteHead: string | null = null;
+        try { remoteHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }); } catch { /* no remote ref yet */ }
+        if (localHead !== remoteHead) {
+          log(`step5 pushing local=${short(localHead)} remote=${short(remoteHead)}`);
+          const pushRes = await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH });
+          log(`step5 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
+        } else {
+          log(`step5 nothing to push (local == remote)`);
         }
       }
 
@@ -386,6 +351,7 @@ export class GitSync {
       return { success: false, conflictFiles: [], error: msg, logs };
     }
   }
+
 
   /** Resolve a conflict by writing resolved content, committing, and pushing */
   async resolveConflict(filepath: string, resolvedContent: string): Promise<void> {

@@ -61,6 +61,22 @@ export class MultiSyncSettingsTab extends PluginSettingTab {
         );
 
       new Setting(containerEl)
+        .setName("Repository name")
+        .setDesc(
+          "The GitHub repo to sync this vault with. Use the SAME name on every device. " +
+          "It will be created under your account if it doesn't exist. Leave blank to use the vault name."
+        )
+        .addText((text) =>
+          text
+            .setPlaceholder("my-vault")
+            .setValue(settings.repoName)
+            .onChange(async (val) => {
+              settings.repoName = val.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+
+      new Setting(containerEl)
         .setName("Connect GitHub account")
         .setDesc(
           "Authorise MultiSync to access your private repos. Opens a browser window."

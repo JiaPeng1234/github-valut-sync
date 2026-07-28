@@ -113,7 +113,8 @@ export default class MultiSyncPlugin extends Plugin {
     this.setStatus("connecting");
 
     const vaultName = this.app.vault.getName();
-    const repoName  = vaultNameToRepoName(vaultName);
+    // Prefer the user-supplied repo name; fall back to a slug of the vault name.
+    const repoName = this.settings.repoName || vaultNameToRepoName(vaultName);
     this.settings.repoName = repoName;
 
     const adapter = this.app.vault.adapter;

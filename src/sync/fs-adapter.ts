@@ -22,13 +22,6 @@ type Stats = {
  * We strip the vaultPath prefix before calling Obsidian's adapter (which uses relative paths).
  */
 export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
-  // DEBUG: capture a bounded sample of adapter calls so we can see, on mobile,
-  // exactly what paths stat/readdir receive and what they return/throw.
-  const dbg: string[] = [];
-  const DBG_MAX = 40;
-  const trace = (m: string) => { if (dbg.length < DBG_MAX) dbg.push(m); };
-  (createFsAdapter as unknown as { lastTrace?: () => string[] }).lastTrace = () => dbg;
-
   /** Strip the vault root prefix so Obsidian adapter gets relative paths */
   function rel(absPath: string): string {
     const normalized = absPath.replace(/\\/g, "/");
@@ -86,15 +79,12 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     },
 
     async readdir(path: string): Promise<string[]> {
-      const r = rel(path);
       try {
-        const result = await adapter.list(r);
+        const result = await adapter.list(rel(path));
         const files = result.files.map((f) => f.split("/").pop()!);
         const folders = result.folders.map((f) => f.split("/").pop()!);
-        trace(`readdir in="${path}" rel="${r}" -> ${folders.length} dirs, ${files.length} files; sampleFile=${result.files[0] ?? "-"}`);
         return [...folders, ...files];
-      } catch (e) {
-        trace(`readdir ERR in="${path}" rel="${r}" msg=${e instanceof Error ? e.message : String(e)}`);
+      } catch {
         const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, scandir '${path}'`);
         err.code = "ENOENT";
         throw err;
@@ -114,11 +104,9 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
     },
 
     async stat(path: string): Promise<Stats> {
-      const r = rel(path);
       try {
-        const s = await adapter.stat(r);
-        if (!s) { trace(`stat NULL in="${path}" rel="${r}"`); throw new Error("no stat"); }
-        trace(`stat OK   in="${path}" rel="${r}" type=${s.type} size=${s.size}`);
+        const s = await adapter.stat(rel(path));
+        if (!s) throw new Error("no stat");
         const isDir = s.type !== "file";
         return {
           type: isDir ? "dir" : "file",
@@ -134,8 +122,7 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
           isDirectory: () => isDir,
           isSymbolicLink: () => false,
         };
-      } catch (e) {
-        trace(`stat ERR  in="${path}" rel="${r}" msg=${e instanceof Error ? e.message : String(e)}`);
+      } catch {
         const err: NodeJS.ErrnoException = new Error(`ENOENT: no such file or directory, stat '${path}'`);
         err.code = "ENOENT";
         throw err;

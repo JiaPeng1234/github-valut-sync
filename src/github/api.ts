@@ -68,10 +68,10 @@ export async function createRepo(
   });
 }
 
-/** Derive a safe repo name from the vault name */
+/** Derive a safe repo name from the vault name (fallback when the user leaves it blank) */
 export function vaultNameToRepoName(vaultName: string): string {
-  return `obsidian-${vaultName
+  return vaultName
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")}`;
+    .replace(/^-+|-+$/g, "");
 }
