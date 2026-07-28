@@ -95,31 +95,6 @@ export default class MultiSyncPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.migrateExcludePatterns();
-  }
-
-  /**
-   * Migrate legacy exclude patterns to the current default. Early versions only
-   * excluded a few .obsidian files, which let plugin code/themes sync and cause
-   * conflicts across devices. If the saved patterns are the old defaults (or
-   * otherwise don't cover the whole .obsidian dir), upgrade to ".obsidian/*".
-   */
-  private migrateExcludePatterns(): void {
-    const p = this.settings.excludePatterns ?? [];
-    const coversObsidian = p.includes(".obsidian/*") || p.includes(".obsidian/**");
-    const legacyDefaults = [
-      ".obsidian/workspace",
-      ".obsidian/workspace.json",
-      ".obsidian/plugins/*/data.json",
-    ];
-    const isLegacy =
-      p.length <= legacyDefaults.length &&
-      p.every((x) => legacyDefaults.includes(x));
-    if (!coversObsidian && (isLegacy || p.length === 0)) {
-      this.settings.excludePatterns = [".obsidian/*"];
-      // Persist so the upgrade sticks; ignore errors (settings save is best-effort).
-      void this.saveSettings();
-    }
   }
 
   async saveSettings(): Promise<void> {
