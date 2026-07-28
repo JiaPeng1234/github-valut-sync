@@ -33,6 +33,13 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
   function rel(absPath: string): string {
     const normalized = absPath.replace(/\\/g, "/");
     const base = vaultPath.replace(/\\/g, "/").replace(/\/$/, "");
+    if (base === "") return normalized.replace(/^\//, "");
+    // The vault root itself (absPath === base) must map to "", not to `base`.
+    // Otherwise adapter.list(base) looks for a subfolder literally named after
+    // the vault dir, fails, and isomorphic-git sees an EMPTY working tree — every
+    // tracked file then shows W=0 ("missing in workdir"), producing phantom
+    // commits that never merge/pull. This is the mobile-only root-dir case.
+    if (normalized === base) return "";
     if (normalized.startsWith(base + "/")) {
       return normalized.slice(base.length + 1);
     }
