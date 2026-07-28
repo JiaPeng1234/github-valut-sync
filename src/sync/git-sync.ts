@@ -267,20 +267,38 @@ export class GitSync {
       let hasDirty: boolean;
       try {
         const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-        hasDirty = matrix.some(([, h, w, s]) => h !== 1 || w !== 1 || s !== 1);
-      } catch {
+        const dirtyRows = matrix.filter(([, h, w, s]) => h !== 1 || w !== 1 || s !== 1);
+        hasDirty = dirtyRows.length > 0;
+        // Show exactly WHICH files are dirty and their H/W/S codes (first 20).
+        log(`step2 dirty=${dirtyRows.length}/${matrix.length}`);
+        for (const [fp, h, w, s] of dirtyRows.slice(0, 20)) {
+          log(`step2   ${fp} H=${h} W=${w} S=${s}`);
+        }
+        if (dirtyRows.length > 20) log(`step2   ...+${dirtyRows.length - 20} more`);
+      } catch (e) {
         // Fall back: assume dirty when files were changed
         hasDirty = changedFiles.length > 0;
+        log(`step2 statusMatrix THREW: ${e instanceof Error ? e.message : String(e)}`);
       }
-      log(`step2 hasDirty=${hasDirty}`);
 
       if (hasDirty) {
+        // Record the tree BEFORE committing so we can tell if the commit is a
+        // phantom (identical tree = nothing really changed).
+        let treeBefore = "?";
+        try {
+          const cur = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+          const c = await git.readCommit({ fs: this.fs, dir: this.dir, oid: cur });
+          treeBefore = c.commit.tree;
+        } catch { /* unborn branch */ }
+
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
         const oid = await git.commit({
           ...this.gitOpts(),
           message: `sync: ${now}`,
         });
-        log(`step2 committed local=${short(oid)}`);
+        const newCommit = await git.readCommit({ fs: this.fs, dir: this.dir, oid });
+        const treeAfter = newCommit.commit.tree;
+        log(`step2 committed local=${short(oid)} treeBefore=${short(treeBefore)} treeAfter=${short(treeAfter)} phantom=${treeBefore === treeAfter}`);
         // refs/heads/main is now guaranteed to exist
       }
 
