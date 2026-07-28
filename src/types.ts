@@ -18,9 +18,10 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   autoSync: true,
   syncIntervalMs: 3000,
   excludePatterns: [
-    ".obsidian/workspace",
-    ".obsidian/workspace.json",
-    ".obsidian/plugins/*/data.json",
+    // Never sync the .obsidian config dir: plugin code, themes, and device-local
+    // state differ per device (and between desktop/mobile) and cause conflicts.
+    // Each device manages its own plugins/config; only notes & attachments sync.
+    ".obsidian/*",
   ],
   lastSyncTime: 0,
   commitMessageTemplate: "sync: {{datetime}}",
