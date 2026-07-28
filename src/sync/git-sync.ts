@@ -275,6 +275,11 @@ export class GitSync {
           log(`step2   ${fp} H=${h} W=${w} S=${s}`);
         }
         if (dirtyRows.length > 20) log(`step2   ...+${dirtyRows.length - 20} more`);
+        // Dump the fs-adapter call trace captured during statusMatrix.
+        const traceFn = (createFsAdapter as unknown as { lastTrace?: () => string[] }).lastTrace;
+        const tr = traceFn ? traceFn() : [];
+        log(`step2 fs-trace (${tr.length} calls):`);
+        for (const t of tr) log(`step2   ${t}`);
       } catch (e) {
         // Fall back: assume dirty when files were changed
         hasDirty = changedFiles.length > 0;
