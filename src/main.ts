@@ -42,8 +42,13 @@ export default class MultiSyncPlugin extends Plugin {
       if (this.gitSync) {
         this.setStatus("pulling");
         try {
-          await this.gitSync.pull();
-          this.setStatus("idle");
+          const conflicts = await this.gitSync.pull();
+          if (conflicts.length > 0) {
+            this.setStatus("conflict");
+            this.showConflictModal(conflicts);
+          } else {
+            this.setStatus("idle");
+          }
         } catch {
           // Pull errors on open are non-fatal (e.g. offline) — just show error state
           this.setStatus("error", "Pull failed on open");
@@ -124,7 +129,9 @@ export default class MultiSyncPlugin extends Plugin {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const vaultPath: string = (adapter as any).basePath ?? "";
 
-    const sync = new GitSync(adapter, vaultPath, token, username, repoName);
+    const sync = new GitSync(adapter, vaultPath, token, username, repoName, (p) =>
+      this.isExcluded(p)
+    );
 
     const exists      = await repoExists(token, username, repoName);
     const alreadyInit = await sync.isInitialized();
@@ -178,7 +185,8 @@ export default class MultiSyncPlugin extends Plugin {
       vaultPath,
       githubToken,
       githubUsername,
-      repoName
+      repoName,
+      (p) => this.isExcluded(p)
     );
 
     this.syncQueue = new SyncQueue(this.gitSync, (status, detail) => {
@@ -238,9 +246,19 @@ export default class MultiSyncPlugin extends Plugin {
       this.app,
       conflicts,
       async (filepath, resolved) => {
-        await this.gitSync!.resolveConflict(filepath, resolved);
-        this.settings.lastSyncTime = Date.now();
-        await this.saveSettings();
+        // Returns true only once EVERY conflict is decided and the merge landed.
+        const merged = await this.gitSync!.resolveConflict(filepath, resolved);
+        if (merged) {
+          this.settings.lastSyncTime = Date.now();
+          await this.saveSettings();
+          this.setStatus("idle");
+          new Notice("Conflicts resolved — vault synced.");
+        }
+      },
+      () => {
+        // Dismissed without deciding everything: drop the pending merge so the
+        // repo stays exactly as it was. The next sync will offer it again.
+        this.gitSync?.abandonMerge();
         this.setStatus("idle");
       }
     ).open();

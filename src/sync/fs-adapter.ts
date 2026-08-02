@@ -40,10 +40,21 @@ export function createFsAdapter(adapter: DataAdapter, vaultPath: string) {
   }
 
   const promises = {
-    async readFile(path: string, options?: { encoding?: string }): Promise<Buffer | string> {
+    async readFile(
+      path: string,
+      options?: string | { encoding?: string }
+    ): Promise<Buffer | string> {
       try {
         const content = await adapter.readBinary(rel(path));
-        if (options?.encoding === "utf8") {
+        // isomorphic-git asks for text in TWO shapes: `{ encoding: "utf8" }` and a
+        // BARE STRING `"utf8"` (see GitIgnoreManager.isIgnored, which reads
+        // .gitignore via `fs.read(path, "utf8")`). Handling only the object form
+        // returns a Buffer where a string was expected — the ignore parser then
+        // silently matches nothing, so gitignored files (.obsidian/plugins/**)
+        // show up as untracked and get reported as bogus "conflicts".
+        const encoding =
+          typeof options === "string" ? options : options?.encoding;
+        if (encoding === "utf8" || encoding === "utf-8") {
           return Buffer.from(content).toString("utf8");
         }
         return Buffer.from(content);

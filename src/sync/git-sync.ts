@@ -51,25 +51,50 @@ const gitHttp = {
   },
 };
 
+/**
+ * State captured when a merge stops on real conflicts. The merge is NOT applied
+ * until every conflicted path has a resolution, so an abandoned conflict modal
+ * leaves the repo exactly as it was.
+ */
+type PendingMerge = {
+  ourHead: string;
+  theirHead: string;
+  /** Conflicted paths still awaiting a user decision. */
+  unresolved: Set<string>;
+  /** path → the content the user chose to keep. */
+  resolutions: Map<string, string>;
+  /**
+   * Paths conflicting because one side DELETED the file. isomorphic-git's
+   * mergeDriver is never consulted for these, so they need the manual path.
+   */
+  deletions: Set<string>;
+};
+
 export class GitSync {
   private fs: ReturnType<typeof createFsAdapter>;
   private dir: string;
   private token: string;
   private username: string;
   private remoteUrl: string;
+  /** Set when sync() hits real merge conflicts; consumed by resolveConflict(). */
+  private pendingMerge: PendingMerge | null = null;
+  /** Paths the user excluded from sync; never staged, never treated as conflicts. */
+  private isExcluded: (filepath: string) => boolean;
 
   constructor(
     adapter: DataAdapter,
     vaultPath: string,
     token: string,
     username: string,
-    repoName: string
+    repoName: string,
+    isExcluded: (filepath: string) => boolean = () => false
   ) {
     this.fs = createFsAdapter(adapter, vaultPath);
     this.dir = vaultPath;
     this.token = token;
     this.username = username;
     this.remoteUrl = `https://github.com/${username}/${repoName}.git`;
+    this.isExcluded = isExcluded;
   }
 
   /** Base options shared by ALL git operations (local and network) */
@@ -232,18 +257,16 @@ export class GitSync {
   /**
    * Full sync cycle — runs on every file change and manual sync trigger.
    *
-   * Order matters: PULL FIRST, then commit local work, then push. Committing
-   * before pulling makes the local branch look "ahead" of the remote, so a
-   * later merge reports `alreadyMerged` and remote changes are never pulled.
+   *   1. Stage + commit local work FIRST, so nothing on disk can be clobbered
+   *      by the merge/checkout that follows.
+   *   2. Fetch, then merge the remote in. A real merge conflict is reported to
+   *      the caller WITHOUT mutating the repo (see mergeRemote).
+   *   3. Push (skipped when conflicts are outstanding or nothing is ahead).
    *
-   *   1. Fetch + merge remote into local  (pull)
-   *   2. Stage changed files
-   *   3. Commit ONLY if the tree actually changed  (no phantom commits)
-   *   4. Detect conflicts
-   *   5. Push  (skipped if conflicts or nothing to push)
+   * Committing before merging is safe: isomorphic-git creates a proper merge
+   * commit for diverged histories, so remote work is never dropped.
    */
   async sync(changedFiles: string[]): Promise<SyncResult> {
-    const conflicts: ConflictFile[] = [];
     const logs: string[] = [];
     const log = (m: string) => { logs.push(m); console.log(`[git-sync] ${m}`); };
     const short = (oid: string | null) => (oid ? oid.slice(0, 7) : String(oid));
@@ -251,36 +274,9 @@ export class GitSync {
     log(`sync() start — ${changedFiles.length} candidate files`);
 
     try {
-      // ── 1. Pull: fetch + merge remote FIRST ──────────────────────────────────
-      this.lastFetchError = null;
-      const fetchHead = await this.safeFetch();
-      log(`step1 fetchHead=${short(fetchHead)}`);
-      if (fetchHead === null && this.lastFetchError) log(`step1 ${this.lastFetchError}`);
-
-      if (fetchHead && (await this.hasLocalBranch())) {
-        const localHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
-        if (fetchHead !== localHead) {
-          const mergeRes = await git.merge({
-            fs: this.fs,
-            dir: this.dir,
-            ours: DEFAULT_BRANCH,
-            theirs: fetchHead,
-            author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
-            message: "sync: merge remote changes",
-            fastForwardOnly: false,
-          });
-          log(`step1 merge=${JSON.stringify(mergeRes)} main=${short(await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH }))}`);
-          // Checkout so the merged tree lands in the working directory (files on disk).
-          try {
-            await git.checkout({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH, force: true });
-          } catch (e) {
-            log(`step1 checkout skipped: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
-      }
-
-      // ── 2. Stage changed files ───────────────────────────────────────────────
+      // ── 1. Commit local work FIRST (protects unsaved edits from checkout) ────
       for (const file of changedFiles) {
+        if (this.isExcluded(file)) continue;
         try {
           await git.add({ fs: this.fs, dir: this.dir, filepath: file });
         } catch {
@@ -290,56 +286,45 @@ export class GitSync {
         }
       }
 
-      // ── 3. Commit ONLY if the staged tree differs from HEAD ───────────────────
-      // A row where stage != head means the commit would change the tree. If no
-      // such row exists, committing would just duplicate HEAD's tree (a phantom
-      // commit that advances local HEAD past the remote and blocks future pulls).
+      // Commit ONLY if the staged tree differs from HEAD. Otherwise we'd create a
+      // phantom commit that advances local HEAD past the remote for no reason.
       const hasLocal = await this.hasLocalBranch();
       let stagedChange = false;
       try {
-        const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-        // [ , head, workdir, stage ]  — commit-worthy when stage differs from head.
+        const matrix = await this.trackedStatus();
         stagedChange = matrix.some(([, head, , stage]) => stage !== head);
       } catch {
         stagedChange = changedFiles.length > 0; // unborn branch / status unavailable
       }
-      // On an unborn branch we must commit once to create refs/heads/main.
       const mustCommit = stagedChange || !hasLocal;
-      log(`step3 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
+      log(`step1 stagedChange=${stagedChange} hasLocal=${hasLocal} commit=${mustCommit}`);
 
       if (mustCommit) {
         const now = new Date().toISOString().replace("T", " ").slice(0, 19);
         const oid = await git.commit({ ...this.gitOpts(), message: `sync: ${now}` });
-        log(`step3 committed=${short(oid)}`);
-      } else {
-        log(`step3 nothing to commit`);
+        log(`step1 committed=${short(oid)}`);
       }
 
-      // ── 4. Detect conflicts ──────────────────────────────────────────────────
-      if (await this.hasLocalBranch()) {
-        const statusAfter = await git.statusMatrix({ fs: this.fs, dir: this.dir });
-        for (const [filepath, head, workdir, stage] of statusAfter) {
-          if (stage === 2 || (head === 0 && workdir === 2 && stage === 0)) {
-            const ours   = await this.readFileContent(filepath);
-            const theirs = await this.readRemoteFileContent(filepath);
-            conflicts.push({ path: filepath, ours, theirs });
-          }
-        }
-      }
-      log(`step4 conflicts=${conflicts.length}`);
+      // ── 2. Fetch + merge remote ─────────────────────────────────────────────
+      this.lastFetchError = null;
+      const fetchHead = await this.safeFetch();
+      log(`step2 fetchHead=${short(fetchHead)}`);
+      if (fetchHead === null && this.lastFetchError) log(`step2 ${this.lastFetchError}`);
 
-      // ── 5. Push ──────────────────────────────────────────────────────────────
+      const conflicts = await this.mergeRemote(fetchHead, log);
+
+      // ── 3. Push ─────────────────────────────────────────────────────────────
       if (conflicts.length === 0 && (await this.hasLocalBranch())) {
         // Only push if local is actually ahead of the remote-tracking ref.
         const localHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
         let remoteHead: string | null = null;
         try { remoteHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: `refs/remotes/origin/${DEFAULT_BRANCH}` }); } catch { /* no remote ref yet */ }
         if (localHead !== remoteHead) {
-          log(`step5 pushing local=${short(localHead)} remote=${short(remoteHead)}`);
+          log(`step3 pushing local=${short(localHead)} remote=${short(remoteHead)}`);
           const pushRes = await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH });
-          log(`step5 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
+          log(`step3 pushRes=${JSON.stringify(pushRes?.ok ?? pushRes)}`);
         } else {
-          log(`step5 nothing to push (local == remote)`);
+          log(`step3 nothing to push (local == remote)`);
         }
       }
 
@@ -353,78 +338,305 @@ export class GitSync {
   }
 
 
-  /** Resolve a conflict by writing resolved content, committing, and pushing */
-  async resolveConflict(filepath: string, resolvedContent: string): Promise<void> {
-    const fullPath = `${this.dir}/${filepath}`;
-    await this.fs.promises.writeFile(fullPath, resolvedContent);
-    await git.add({ fs: this.fs, dir: this.dir, filepath });
+  /**
+   * statusMatrix restricted to paths that actually participate in sync.
+   *
+   * `statusMatrix` lists every untracked file in the working tree. Excluded paths
+   * (e.g. `.obsidian/*`) must never influence commit decisions or be mistaken for
+   * conflicts, so they are filtered out here.
+   */
+  private async trackedStatus(): Promise<Array<[string, number, number, number]>> {
+    const matrix = await git.statusMatrix({ fs: this.fs, dir: this.dir });
+    return matrix.filter(([filepath]) => !this.isExcluded(filepath)) as Array<
+      [string, number, number, number]
+    >;
+  }
+
+  /**
+   * Merge the fetched remote head into the local branch.
+   *
+   * Returns the list of genuinely conflicting files. Crucially, when conflicts
+   * exist NOTHING is written: the merge runs with `dryRun` so HEAD, the index and
+   * the working tree are untouched until every conflict has a resolution. That
+   * makes dismissing the conflict modal a true no-op.
+   */
+  private async mergeRemote(
+    fetchHead: string | null,
+    log: (m: string) => void
+  ): Promise<ConflictFile[]> {
+    this.pendingMerge = null;
+    if (!fetchHead || !(await this.hasLocalBranch())) return [];
+
+    const ourHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+    if (ourHead === fetchHead) {
+      log(`step2 already up to date`);
+      return [];
+    }
+
+    // Probe first: dryRun means a conflict costs us nothing.
+    try {
+      const res = await git.merge({
+        ...this.gitOpts(),
+        ours: DEFAULT_BRANCH,
+        theirs: fetchHead,
+        message: "sync: merge remote changes",
+        fastForwardOnly: false,
+        abortOnConflict: true,
+        dryRun: true,
+      });
+      log(`step2 merge probe clean=${JSON.stringify(res)}`);
+    } catch (e) {
+      const err = e as { code?: string; data?: { filepaths?: string[]; deleteByUs?: string[]; deleteByTheirs?: string[] } };
+      if (err.code !== "MergeConflictError") throw e;
+
+      const paths = (err.data?.filepaths ?? []).filter((p) => !this.isExcluded(p));
+      log(`step2 conflicts=${paths.length} ${JSON.stringify(paths)}`);
+      if (paths.length === 0) {
+        // Every conflict was in an excluded path — nothing the user should see.
+        // We cannot merge automatically, so leave the repo as-is and report clean.
+        log(`step2 all conflicts excluded; skipping merge`);
+        return [];
+      }
+
+      const deletions = new Set(
+        [...(err.data?.deleteByUs ?? []), ...(err.data?.deleteByTheirs ?? [])].filter(
+          (p) => !this.isExcluded(p)
+        )
+      );
+
+      this.pendingMerge = {
+        ourHead,
+        theirHead: fetchHead,
+        unresolved: new Set(paths),
+        resolutions: new Map(),
+        deletions,
+      };
+
+      const conflicts: ConflictFile[] = [];
+      for (const p of paths) {
+        conflicts.push({
+          path: p,
+          ours: await this.readBlobAt(ourHead, p),
+          theirs: await this.readBlobAt(fetchHead, p),
+        });
+      }
+      return conflicts;
+    }
+
+    // No conflicts — apply the merge for real, then materialise it on disk.
+    await git.merge({
+      ...this.gitOpts(),
+      ours: DEFAULT_BRANCH,
+      theirs: fetchHead,
+      message: "sync: merge remote changes",
+      fastForwardOnly: false,
+      abortOnConflict: true,
+    });
+    await this.checkoutMergedPaths(ourHead, log);
+    return [];
+  }
+
+  /**
+   * Check out only the paths the merge actually changed.
+   *
+   * A blanket `checkout({ force: true })` would overwrite every dirty file in the
+   * vault — including excluded files and edits Obsidian hasn't flushed yet.
+   */
+  private async checkoutMergedPaths(
+    beforeHead: string,
+    log: (m: string) => void
+  ): Promise<void> {
+    try {
+      const afterHead = await git.resolveRef({ fs: this.fs, dir: this.dir, ref: DEFAULT_BRANCH });
+      if (afterHead === beforeHead) return;
+
+      const [before, after] = await Promise.all([
+        git.listFiles({ fs: this.fs, dir: this.dir, ref: beforeHead }),
+        git.listFiles({ fs: this.fs, dir: this.dir, ref: afterHead }),
+      ]);
+
+      const changed: string[] = [];
+      for (const filepath of new Set([...before, ...after])) {
+        if (this.isExcluded(filepath)) continue;
+        const [a, b] = await Promise.all([
+          this.blobOidAt(beforeHead, filepath),
+          this.blobOidAt(afterHead, filepath),
+        ]);
+        if (a !== b) changed.push(filepath);
+      }
+
+      if (changed.length === 0) return;
+      await git.checkout({
+        fs: this.fs,
+        dir: this.dir,
+        ref: DEFAULT_BRANCH,
+        force: true,
+        filepaths: changed,
+      });
+      log(`step2 checked out ${changed.length} merged path(s)`);
+    } catch (e) {
+      log(`step2 checkout skipped: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Record the user's decision for one conflicted file.
+   *
+   * The merge is only applied once EVERY conflicted path has been decided, and it
+   * is applied as a single real merge commit (two parents) whose tree is built by
+   * isomorphic-git. That preserves the remote's non-conflicting changes — hand-
+   * building the commit from the index would silently drop them.
+   *
+   * Returns true when the merge was completed and pushed.
+   */
+  async resolveConflict(filepath: string, resolvedContent: string): Promise<boolean> {
+    const pending = this.pendingMerge;
+    if (!pending) {
+      // No merge in flight — just save the file and let the next sync handle it.
+      await this.fs.promises.writeFile(`${this.dir}/${filepath}`, resolvedContent);
+      return false;
+    }
+
+    pending.resolutions.set(filepath, resolvedContent);
+    pending.unresolved.delete(filepath);
+    if (pending.unresolved.size > 0) return false;
+
+    // All decisions in — replay the merge, injecting the chosen content.
+    const { ourHead, theirHead, resolutions, deletions } = pending;
+    this.pendingMerge = null;
+
+    if (deletions.size === 0) {
+      // Content-only conflicts: let isomorphic-git build the merge tree via the
+      // merge driver. This keeps the remote's non-conflicting changes intact.
+      await git.merge({
+        ...this.gitOpts(),
+        ours: DEFAULT_BRANCH,
+        theirs: theirHead,
+        message: "sync: merge remote changes (conflicts resolved)",
+        fastForwardOnly: false,
+        abortOnConflict: true,
+        mergeDriver: ({ path: p, contents }) => {
+          const chosen = resolutions.get(p);
+          return chosen !== undefined
+            ? { cleanMerge: true, mergedText: chosen }
+            : { cleanMerge: false, mergedText: contents[1] };
+        },
+      });
+      await this.checkoutMergedPaths(ourHead, () => {});
+    } else {
+      // A delete/modify conflict never reaches the merge driver, so apply the
+      // merge with conflict markers, overwrite each decided path, then commit a
+      // real two-parent merge. Staging is restricted to paths tracked by either
+      // side so untracked/excluded files are never swept in.
+      await this.applyMergeManually(ourHead, theirHead, resolutions);
+    }
+
+    await git.push({ ...this.netOpts(), ref: DEFAULT_BRANCH });
+    return true;
+  }
+
+  /**
+   * Fallback merge path for delete/modify conflicts.
+   *
+   * `git.merge({ abortOnConflict: false })` writes the merge into the index and
+   * working tree, we then force each conflicted path to the user's choice and
+   * commit with both parents so the remote history is properly included.
+   */
+  private async applyMergeManually(
+    ourHead: string,
+    theirHead: string,
+    resolutions: Map<string, string>
+  ): Promise<void> {
+    try {
+      await git.merge({
+        ...this.gitOpts(),
+        ours: DEFAULT_BRANCH,
+        theirs: theirHead,
+        message: "sync: merge remote changes (conflicts resolved)",
+        fastForwardOnly: false,
+        abortOnConflict: false,
+      });
+    } catch (e) {
+      if ((e as { code?: string }).code !== "MergeConflictError") throw e;
+    }
+
+    // Apply the user's decision for every conflicted path.
+    for (const [filepath, content] of resolutions) {
+      // An empty choice means the file did not exist on the chosen side —
+      // honour that as a deletion rather than writing a zero-byte file.
+      if (content === "") {
+        await this.fs.promises.unlink(`${this.dir}/${filepath}`);
+      } else {
+        await this.fs.promises.writeFile(`${this.dir}/${filepath}`, content);
+      }
+    }
+
+    // Stage only paths tracked by one of the two sides.
+    const tracked = new Set([
+      ...(await git.listFiles({ fs: this.fs, dir: this.dir, ref: ourHead })),
+      ...(await git.listFiles({ fs: this.fs, dir: this.dir, ref: theirHead })),
+    ]);
+    for (const [filepath, head, workdir, stage] of await this.trackedStatus()) {
+      if (!tracked.has(filepath)) continue;
+      try {
+        if (workdir === 0) {
+          await git.remove({ fs: this.fs, dir: this.dir, filepath });
+        } else if (stage !== head || workdir !== head || stage === 3) {
+          await git.add({ fs: this.fs, dir: this.dir, filepath });
+        }
+      } catch { /* leave undecidable paths to the next sync */ }
+    }
+
     await git.commit({
       ...this.gitOpts(),
-      message: `sync: resolve conflict in ${filepath}`,
+      message: "sync: merge remote changes (conflicts resolved)",
+      parent: [ourHead, theirHead],
     });
-    await git.push({
-      ...this.netOpts(),
-      ref: DEFAULT_BRANCH,
-    });
+    await this.checkoutMergedPaths(ourHead, () => {});
+  }
+
+  /** Discard an in-flight merge (user dismissed the conflict modal). */
+  abandonMerge(): void {
+    this.pendingMerge = null;
   }
 
   /**
    * Pull-only — used on vault open to get latest without pushing.
-   * Uses explicit fetch + merge (not git.pull) for consistent error handling.
+   *
+   * Returns any conflicts so the caller can surface the modal. Like sync(), a
+   * conflicting merge leaves the repo untouched until the user decides.
    */
-  async pull(): Promise<void> {
-    if (!(await this.hasLocalBranch())) return;
+  async pull(): Promise<ConflictFile[]> {
+    if (!(await this.hasLocalBranch())) return [];
 
     const fetchHead = await this.safeFetch();
-    if (!fetchHead) return;
+    if (!fetchHead) return [];
 
-    const localHead = await git.resolveRef({
-      fs: this.fs,
-      dir: this.dir,
-      ref: DEFAULT_BRANCH,
-    });
-
-    if (fetchHead !== localHead) {
-      await git.merge({
-        fs: this.fs,
-        dir: this.dir,
-        ours: DEFAULT_BRANCH,
-        theirs: fetchHead,
-        author: { name: GIT_AUTHOR_NAME, email: GIT_AUTHOR_EMAIL },
-        message: "sync: merge remote changes",
-        fastForwardOnly: false,
-      });
-    }
+    return this.mergeRemote(fetchHead, (m) => console.log(`[git-sync] ${m}`));
   }
 
-  private async readFileContent(filepath: string): Promise<string> {
+  /** Contents of `filepath` as of commit `oid`, or "" when absent (deleted there). */
+  private async readBlobAt(oid: string, filepath: string): Promise<string> {
     try {
-      const buf = await this.fs.promises.readFile(
-        `${this.dir}/${filepath}`,
-        { encoding: "utf8" }
-      );
-      return buf as string;
-    } catch {
-      return "";
-    }
-  }
-
-  private async readRemoteFileContent(filepath: string): Promise<string> {
-    try {
-      const remoteCommit = await git.resolveRef({
-        fs: this.fs,
-        dir: this.dir,
-        ref: `refs/remotes/origin/${DEFAULT_BRANCH}`,
-      });
-      const { blob } = await git.readBlob({
-        fs: this.fs,
-        dir: this.dir,
-        oid: remoteCommit,
-        filepath,
-      });
+      const { blob } = await git.readBlob({ fs: this.fs, dir: this.dir, oid, filepath });
       return new TextDecoder().decode(blob);
     } catch {
       return "";
+    }
+  }
+
+  /** Blob oid of `filepath` at commit `oid`, or null when the path is absent. */
+  private async blobOidAt(oid: string, filepath: string): Promise<string | null> {
+    try {
+      const { oid: blobOid } = await git.readBlob({
+        fs: this.fs,
+        dir: this.dir,
+        oid,
+        filepath,
+      });
+      return blobOid;
+    } catch {
+      return null;
     }
   }
 }

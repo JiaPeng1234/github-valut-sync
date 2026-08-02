@@ -8,12 +8,21 @@ export class ConflictModal extends Modal {
   private conflicts: ConflictFile[];
   private currentIndex = 0;
   private onResolve: ResolveCallback;
+  private onAbandon: () => void;
   private component: Component;
+  /** True once every conflict has been decided — suppresses the abandon callback. */
+  private completed = false;
 
-  constructor(app: App, conflicts: ConflictFile[], onResolve: ResolveCallback) {
+  constructor(
+    app: App,
+    conflicts: ConflictFile[],
+    onResolve: ResolveCallback,
+    onAbandon: () => void = () => {}
+  ) {
     super(app);
     this.conflicts = conflicts;
     this.onResolve = onResolve;
+    this.onAbandon = onAbandon;
     this.component = new Component();
   }
 
@@ -25,6 +34,9 @@ export class ConflictModal extends Modal {
   onClose(): void {
     this.component.unload();
     this.contentEl.empty();
+    // Closed early (X / Esc / "Open in Editor") — nothing was merged, so tell the
+    // caller to discard the pending merge rather than leave it half-applied.
+    if (!this.completed) this.onAbandon();
   }
 
   private renderCurrent(): void {
@@ -98,8 +110,11 @@ export class ConflictModal extends Modal {
   }
 
   private async resolve(conflict: ConflictFile, content: string): Promise<void> {
-    await this.onResolve(conflict.path, content);
     this.currentIndex++;
+    // Mark complete BEFORE the last onResolve so close() doesn't abandon the merge
+    // that this very call is about to apply.
+    if (this.currentIndex >= this.conflicts.length) this.completed = true;
+    await this.onResolve(conflict.path, content);
     if (this.currentIndex < this.conflicts.length) {
       this.renderCurrent();
     } else {
